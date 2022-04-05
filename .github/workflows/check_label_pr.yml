@@ -1,0 +1,25 @@
+name: paser-github-id
+
+on:
+  issue_comment:
+    types: [created]
+  # Allows to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  check-label-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/github-script@v3
+        id: test-pr-body
+        with:
+          script: |
+            return JSON.stringify(context.payload);
+
+      - name: Create comment
+        uses: peter-evans/create-or-update-comment@v1
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          body: |
+            ${{ steps.parse-repo-org-id.outputs.result }}
