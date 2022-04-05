@@ -28,6 +28,10 @@ let config = {
       accessKeySecret: '',
       bucket: '',
     }
+  },
+  ci: {
+    labelDocPath: 'docs/label_data.adoc',
+    token: process.env.GITHUB_TOKEN,
   }
 };
 

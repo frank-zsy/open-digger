@@ -30,5 +30,7 @@ data:
     - 435180749 # repo:apache/skywalking-booster-ui
     - 83632281 # repo:apache/skywalking-ui
     - 140874933 # repo:apache/skywalking-oal-tool
+    - 140874933 # repo:apache/skywalking-oal-tool
+    - 140874933 # repo:apache/skywalking-oal-tool
   github_org:
     - 32165127 # org:SkyAPM
