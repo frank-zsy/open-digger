@@ -478,15 +478,17 @@ export const getUserTalent = async (config: QueryConfig): Promise<any[]> => {
     return user.years[year];
   };
 
+  const POWER_MEAN_P = 4; // Power Mean exponent: higher values emphasize top contributions more
+
   // 1. Pull quality data
   const pullSql = `
 SELECT
   platform,
   actor_id,
   toYear(created_at) AS year,
-  AVG(multiIf(code_quality = 1, 1, code_quality = 2, 0.8, code_quality = 3, 0.6, code_quality = 4, 0.4, 0.2)) AS avg_code_quality,
-  AVG(multiIf(pr_title_and_description_quality = 1, 1, pr_title_and_description_quality = 2, 0.8, pr_title_and_description_quality = 3, 0.6, pr_title_and_description_quality = 4, 0.4, 0.2)) AS avg_pr_title_and_description_quality,
-  AVG((5 - value_level) * 0.2 / 0.8) AS avg_value_level,
+  pow(AVG(pow(multiIf(code_quality = 1, 1, code_quality = 2, 0.8, code_quality = 3, 0.6, code_quality = 4, 0.4, 0.2), ${POWER_MEAN_P})), 1.0/${POWER_MEAN_P}) AS avg_code_quality,
+  pow(AVG(pow(multiIf(pr_title_and_description_quality = 1, 1, pr_title_and_description_quality = 2, 0.8, pr_title_and_description_quality = 3, 0.6, pr_title_and_description_quality = 4, 0.4, 0.2), ${POWER_MEAN_P})), 1.0/${POWER_MEAN_P}) AS avg_pr_title_and_description_quality,
+  pow(AVG(pow((5 - value_level) * 0.2 / 0.8, ${POWER_MEAN_P})), 1.0/${POWER_MEAN_P}) AS avg_value_level,
   groupArray(pr_type) AS pr_type_array
 FROM
 (
@@ -503,7 +505,7 @@ SELECT
   platform,
   actor_id,
   toYear(created_at) AS year,
-  AVG(multiIf(information_quality = 1, 0.2, information_quality = 2, 0.4, information_quality = 3, 0.6, information_quality = 4, 0.8, 1)) AS avg_information_quality
+  pow(AVG(pow(multiIf(information_quality = 1, 0.2, information_quality = 2, 0.4, information_quality = 3, 0.6, information_quality = 4, 0.8, 1), ${POWER_MEAN_P})), 1.0/${POWER_MEAN_P}) AS avg_information_quality
 FROM
 (
   SELECT e.repo_id, e.actor_id, e.created_at, e.issue_id, e.platform, p.information_quality
