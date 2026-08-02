@@ -11,7 +11,7 @@ const task: Task = {
   callback: async () => {
     const logger = getLogger('GlobalOpenRankTask');
 
-    const globalOpenrankTableName = 'global_openrank';
+    const globalOpenrankTableName = 'global_openrank_with_dep';
     const userRententionFactor = 0.5;
     const repoRententionFactor = 0.3;
     const backgroundRententionFactor = 0.15;
@@ -19,6 +19,9 @@ const task: Task = {
     const openrankMinValue = 0.01;
     const removeUserRelationshipCount = 300;
     const exportMinOpenrank = 5;
+    // Ratio of a repo's outgoing value transferred to its dependency repos.
+    // For repos with deps: users get 0.85, deps share 0.1, background gets 0.05.
+    const dependencyTransferRatio = 0.1;
     const activityToOpenrank = activity => 1 / (1 + Math.exp(0.10425 * (-activity + 44.08)));
 
     const createTable = async () => {
@@ -183,6 +186,30 @@ const task: Task = {
             });
           });
 
+        // load repo dependency relationships that are active in this month, only keep
+        // edges whose both ends are active repo nodes in this month's collaboration graph
+        const monthStart = `${year}-${month.toString().padStart(2, '0')}-01 00:00:00`;
+        const loadDepsSql = `SELECT DISTINCT platform, repo_id, dep_platform, dep_repo_id
+          FROM repo_dependencies
+          WHERE repo_id != 0 AND dep_repo_id != 0
+            AND start_time < addMonths(toDateTime('${monthStart}'), 1)
+            AND (end_time IS NULL OR end_time >= toDateTime('${monthStart}'))`;
+        const repoDepsMap = new Map<string, Set<string>>();
+        await clickhouse.queryStream(loadDepsSql, async row => {
+          if (!Array.isArray(row) || row.length !== 4) {
+            throw new Error(`Load repo dependencies failed for ${yyyymm}, row=${row}`);
+          }
+          const [platform, repoId, depPlatform, depRepoId] = row;
+          const rId = `Repo_${platform}_${repoId}`;
+          const depRId = `Repo_${depPlatform}_${depRepoId}`;
+          if (rId === depRId) return; // skip self dependency
+          // both ends must be active repos in this month (bot-cleaned node map)
+          if (!nodeMap.has(rId) || !nodeMap.has(depRId)) return;
+          if (!repoDepsMap.has(rId)) repoDepsMap.set(rId, new Set<string>());
+          repoDepsMap.get(rId)!.add(depRId);
+        });
+        logger.info(`Load dependency relationships for ${repoDepsMap.size} repos.`);
+
         const bgId = 'Background_GitHub_0';
         nodeMap.set(bgId, { info: {}, createdAt: new Date() });
         const nodeIds = Array.from(nodeMap.keys());
@@ -203,8 +230,21 @@ const task: Task = {
           if (rIndex === undefined || uIndex === undefined) {
             continue;
           }
-          relationships.push({ s: rIndex, t: uIndex, w: 0.95 * activity / activityMap.get(rId)! });
+          // repos with dependencies transfer 10% to deps, so users' share drops to 0.85
+          const repoUserShare = repoDepsMap.has(rId) ? 0.95 - dependencyTransferRatio : 0.95;
+          relationships.push({ s: rIndex, t: uIndex, w: repoUserShare * activity / activityMap.get(rId)! });
           relationships.push({ s: uIndex, t: rIndex, w: 0.95 * activity / activityMap.get(uId)! });
+        }
+        // add dependency relationships: repo evenly splits the transfer ratio among its deps
+        for (const [rId, deps] of repoDepsMap) {
+          const rIndex = nodeIndexMap.get(rId);
+          if (rIndex === undefined) continue;
+          const w = dependencyTransferRatio / deps.size;
+          for (const depRId of deps) {
+            const depIndex = nodeIndexMap.get(depRId);
+            if (depIndex === undefined) continue;
+            relationships.push({ s: rIndex, t: depIndex, w });
+          }
         }
         nodeIds.forEach(n => {
           // add background relationships

@@ -17,6 +17,10 @@ let config = {
     },
     neo4j: {
       url: process.env.NEO4J_URL ?? 'neo4j://localhost',
+    },
+    postgres: {
+      // PostgreSQL connection string for the packages database (ecosyste.ms style)
+      url: process.env.POSTGRES_URL ?? '',
     }
   },
   oss: {
