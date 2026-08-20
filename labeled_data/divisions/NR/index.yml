@@ -10,7 +10,10 @@ meta:
     - the Republic of Nauru
     - 瑙鲁
   name_full: the Republic of Nauru
-  developers: []
+  developers:
+    - year: 2026
+      quarter: 1
+      count: 110
 data:
   labels:
     - NR-01

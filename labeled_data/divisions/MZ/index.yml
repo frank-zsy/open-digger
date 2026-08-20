@@ -83,6 +83,9 @@ meta:
     - year: 2025
       quarter: 4
       count: 42814
+    - year: 2026
+      quarter: 1
+      count: 48751
 data:
   labels:
     - MZ-A

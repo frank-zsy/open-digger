@@ -226,6 +226,8 @@ const task: Task = {
             getField('count', { targetKey: 'active_dates_and_times', ...arrayFieldOption }));
           // [X-lab] contributor email suffixes
           await processMetric(contributorEmailSuffixes, option, getField('suffixes', { targetKey: 'contributor_email_suffixes', ...arrayFieldOption }));
+          // [X-lab] Community OpenRank
+          await processMetric(getRepoCommunityOpenrank, { ...option, options: { limit: 100 } }, getField('details', { targetKey: 'community_openrank_details', ...arrayFieldOption }));
           logger.info(`Process repo for round ${i} done.`);
         }
         logger.info('Process repo export task done.');
@@ -251,7 +253,6 @@ const task: Task = {
             startYear, startMonth, endYear, endMonth,
             whereClause: option.whereClause,
           });
-          console.log(talentData.length);
           for (const user of talentData) {
             if (!user.platform || !user.name) continue;
             const userDir = join(exportBasePath, user.platform.toLowerCase(), user.name);

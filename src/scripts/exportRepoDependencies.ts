@@ -10,7 +10,9 @@
  *                 that declares the dependency (i.e. when it was removed). NULL means
  *                 the dependency is still present in the latest release.
  *
- * All dependency kinds are kept (runtime, Development, dev, test, ...).
+ * All dependency kinds are kept (runtime, Development, dev, test, ...). Package-side
+ * details (registry name, package name, and the version that introduced the dependency)
+ * are carried over from the package that starts the edge earliest.
  *
  * Architecture (the dependencies table has 1.8B rows, so random per-package index
  * access does NOT scale; everything is streamed by sequential version-id ranges and
@@ -26,10 +28,13 @@
  *
  * Usage:
  *   POSTGRES_URL=postgres://user:pass@host:5432/packages_production npm run build
- *   node lib/scripts/exportRepoDependencies.js             # full export + finalize
- *   node lib/scripts/exportRepoDependencies.js finalize    # only run finalize
- *   node lib/scripts/exportRepoDependencies.js enrich      # fill repo_id/dep_repo_id from events
+ *   node lib/scripts/exportRepoDependencies.js             # full export + finalize + enrich
+ *   node lib/scripts/exportRepoDependencies.js packages    # only rebuild repo_dep_packages (Phase A)
+ *   node lib/scripts/exportRepoDependencies.js versions    # only rebuild repo_dep_package_versions
+ *   node lib/scripts/exportRepoDependencies.js finalize     # only run finalize
+ *   node lib/scripts/exportRepoDependencies.js enrich       # fill repo_id/dep_repo_id from events
  *   FROM_VERSION_ID=123456 node lib/scripts/exportRepoDependencies.js  # resume Phase B
+ *   FROM_VERSION_ID=123456 node lib/scripts/exportRepoDependencies.js versions  # resume the versions rebuild
  */
 import { Client as PgClient } from 'pg';
 import { getNewClient, insertRecords, queryStream } from '../db/clickhouse';
@@ -50,6 +55,9 @@ const PKG_BATCH_SIZE = parseInt(process.env.PKG_BATCH_SIZE ?? '2000', 10);
 const VERSION_RANGE = parseInt(process.env.VERSION_RANGE ?? '50000', 10);
 // Flush buffered rows into ClickHouse when reaching this size.
 const FLUSH_SIZE = 50000;
+
+// Version numbers are only informational, cap the length to keep aggregation cheap.
+const MAX_VERSION_NUMBER_LEN = 64;
 
 // Note: platform names are case-sensitive and must match the ClickHouse events table.
 const PLATFORM_HOSTS: Array<{ host: string, platform: string }> = [
@@ -126,11 +134,9 @@ function formatEpoch(epochSeconds: number): string {
   const startTime = Date.now();
   const elapsed = () => `${((Date.now() - startTime) / 1000).toFixed(0)}s`;
 
-  const createTables = async (recreateStaging: boolean) => {
-    if (recreateStaging) {
-      for (const t of [PACKAGES_TABLE, VERSIONS_TABLE, RANGES_TABLE]) {
-        await chClient.command({ query: `DROP TABLE IF EXISTS ${t}` });
-      }
+  const createTables = async (dropTables: string[]) => {
+    for (const t of dropTables) {
+      await chClient.command({ query: `DROP TABLE IF EXISTS ${t}` });
     }
     await chClient.command({
       query: `CREATE TABLE IF NOT EXISTS ${PACKAGES_TABLE} (
@@ -138,13 +144,15 @@ function formatEpoch(epochSeconds: number): string {
   ecosystem LowCardinality(String),
   name String,
   platform LowCardinality(String),
-  repo_name String
+  repo_name String,
+  registry LowCardinality(String) DEFAULT ''
 ) ENGINE = MergeTree ORDER BY package_id`,
     });
     await chClient.command({
       query: `CREATE TABLE IF NOT EXISTS ${VERSIONS_TABLE} (
   package_id UInt32,
-  published_at DateTime
+  published_at DateTime,
+  version_number String DEFAULT ''
 ) ENGINE = MergeTree ORDER BY package_id`,
     });
     await chClient.command({
@@ -168,19 +176,40 @@ function formatEpoch(epochSeconds: number): string {
   kind LowCardinality(String),
   ecosystem LowCardinality(String),
   start_time DateTime,
-  end_time Nullable(DateTime)
+  end_time Nullable(DateTime),
+  registry LowCardinality(String) DEFAULT '',
+  package_name String DEFAULT '',
+  dep_registry LowCardinality(String) DEFAULT '',
+  dep_package_name String DEFAULT '',
+  start_version String DEFAULT ''
 ) ENGINE = ReplacingMergeTree ORDER BY (platform, repo_name, dep_platform, dep_repo_name, ecosystem, kind)`,
     });
+    // Tables created by earlier versions of this script may miss the newer columns.
+    const addColumns: Array<[string, string]> = [
+      [PACKAGES_TABLE, `registry LowCardinality(String) DEFAULT ''`],
+      [VERSIONS_TABLE, `version_number String DEFAULT ''`],
+      [FINAL_TABLE, 'repo_id UInt64 DEFAULT 0 AFTER repo_name'],
+      [FINAL_TABLE, 'dep_repo_id UInt64 DEFAULT 0 AFTER dep_repo_name'],
+      [FINAL_TABLE, `registry LowCardinality(String) DEFAULT ''`],
+      [FINAL_TABLE, `package_name String DEFAULT ''`],
+      [FINAL_TABLE, `dep_registry LowCardinality(String) DEFAULT ''`],
+      [FINAL_TABLE, `dep_package_name String DEFAULT ''`],
+      [FINAL_TABLE, `start_version String DEFAULT ''`],
+    ];
+    for (const [table, column] of addColumns) {
+      await chClient.command({ query: `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column}` });
+    }
   };
 
-  // Phase C: merge range partials, compute removal time from version timelines and
-  // aggregate package-level edges into repo-level edges (monorepo packages merged:
-  // min(start); end is NULL if any package still declares the dependency).
+  // Phase C: merge range partials, compute removal time and the version that introduced
+  // the dependency from version timelines, then aggregate package-level edges into
+  // repo-level edges (monorepo packages merged: min(start); end is NULL if any package
+  // still declares the dependency; package-side details follow the earliest start).
   const finalize = async () => {
     logger.info(`[${elapsed()}] Finalizing: aggregating partials into ${FINAL_TABLE}...`);
     await chClient.command({ query: `TRUNCATE TABLE ${FINAL_TABLE}` });
     await chClient.command({
-      query: `INSERT INTO ${FINAL_TABLE} (platform, repo_name, dep_platform, dep_repo_name, kind, ecosystem, start_time, end_time)
+      query: `INSERT INTO ${FINAL_TABLE} (platform, repo_name, dep_platform, dep_repo_name, kind, ecosystem, start_time, end_time, registry, package_name, dep_registry, dep_package_name, start_version)
 SELECT
   sp.platform AS platform,
   sp.repo_name AS repo_name,
@@ -189,11 +218,17 @@ SELECT
   e.kind AS kind,
   e.dep_ecosystem AS ecosystem,
   min(e.start_time) AS start_time,
-  if(countIf(e.removal_time = toDateTime(0)) > 0, NULL, max(e.removal_time)) AS end_time
+  if(countIf(e.removal_time = toDateTime(0)) > 0, NULL, max(e.removal_time)) AS end_time,
+  argMin(sp.src_registry, e.start_time) AS registry_at_start,
+  argMin(sp.src_name, e.start_time) AS package_at_start,
+  argMin(tp.tgt_registry, e.start_time) AS dep_registry_at_start,
+  argMin(e.dep_name, e.start_time) AS dep_package_at_start,
+  argMin(e.start_version, e.start_time) AS version_at_start
 FROM (
   SELECT r.package_id AS package_id, r.dep_ecosystem AS dep_ecosystem, r.dep_name AS dep_name,
          r.kind AS kind, r.start_time AS start_time,
-         arrayFirst(x -> x > r.last_seen, vt.times) AS removal_time
+         tupleElement(arrayFirst(x -> tupleElement(x, 1) > r.last_seen, vt.timeline), 1) AS removal_time,
+         tupleElement(arrayFirst(x -> tupleElement(x, 1) = r.start_time, vt.timeline), 2) AS start_version
   FROM (
     SELECT package_id, dep_ecosystem, dep_name, kind,
            min(start_time) AS start_time, max(last_seen) AS last_seen
@@ -201,13 +236,16 @@ FROM (
     GROUP BY package_id, dep_ecosystem, dep_name, kind
   ) r
   INNER JOIN (
-    SELECT package_id, arraySort(groupArray(published_at)) AS times
+    SELECT package_id, arraySort(groupArray((published_at, version_number))) AS timeline
     FROM ${VERSIONS_TABLE} GROUP BY package_id
   ) vt ON vt.package_id = r.package_id
 ) e
-INNER JOIN ${PACKAGES_TABLE} sp ON sp.package_id = e.package_id
 INNER JOIN (
-  SELECT ecosystem, name, platform, repo_name FROM ${PACKAGES_TABLE}
+  SELECT package_id, platform, repo_name, name AS src_name, registry AS src_registry
+  FROM ${PACKAGES_TABLE}
+) sp ON sp.package_id = e.package_id
+INNER JOIN (
+  SELECT ecosystem, name, platform, repo_name, registry AS tgt_registry FROM ${PACKAGES_TABLE}
   ORDER BY package_id LIMIT 1 BY ecosystem, name
 ) tp ON tp.ecosystem = e.dep_ecosystem AND tp.name = e.dep_name
 WHERE NOT (sp.platform = tp.platform AND sp.repo_name = tp.repo_name)
@@ -225,10 +263,6 @@ GROUP BY platform, repo_name, dep_platform, dep_repo_name, kind, ecosystem`,
   // author-typed so the join is case-insensitive; for renamed/reused names the most
   // recent repo_id owning that name wins (argMax by created_at). Unmatched stays 0.
   const enrich = async () => {
-    // Existing tables exported by older versions may not have the id columns yet.
-    await chClient.command({ query: `ALTER TABLE ${FINAL_TABLE} ADD COLUMN IF NOT EXISTS repo_id UInt64 DEFAULT 0 AFTER repo_name` });
-    await chClient.command({ query: `ALTER TABLE ${FINAL_TABLE} ADD COLUMN IF NOT EXISTS dep_repo_id UInt64 DEFAULT 0 AFTER dep_repo_name` });
-
     logger.info(`[${elapsed()}] Enrich: collecting repo names referenced by ${FINAL_TABLE}...`);
     // Restrict the name->id map to names actually referenced by the dependency edges
     // (a few million) instead of every repo ever seen in events (hundreds of millions),
@@ -263,7 +297,7 @@ GROUP BY platform, name_lower`,
     await chClient.command({ query: `DROP TABLE IF EXISTS ${tmpTable}` });
     await chClient.command({ query: `CREATE TABLE ${tmpTable} AS ${FINAL_TABLE}` });
     await chClient.command({
-      query: `INSERT INTO ${tmpTable}
+      query: `INSERT INTO ${tmpTable} (platform, repo_name, repo_id, dep_platform, dep_repo_name, dep_repo_id, kind, ecosystem, start_time, end_time, registry, package_name, dep_registry, dep_package_name, start_version)
 SELECT
   d.platform AS platform,
   d.repo_name AS repo_name,
@@ -274,7 +308,12 @@ SELECT
   d.kind AS kind,
   d.ecosystem AS ecosystem,
   d.start_time AS start_time,
-  d.end_time AS end_time
+  d.end_time AS end_time,
+  d.registry AS registry,
+  d.package_name AS package_name,
+  d.dep_registry AS dep_registry,
+  d.dep_package_name AS dep_package_name,
+  d.start_version AS start_version
 FROM ${FINAL_TABLE} d
 LEFT JOIN ${NAME_MAP_TABLE} m1 ON m1.platform = d.platform AND m1.name_lower = lower(d.repo_name)
 LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower = lower(d.dep_repo_name)`,
@@ -300,14 +339,20 @@ LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower
 
   const fromVersionId = parseInt(process.env.FROM_VERSION_ID ?? '0', 10);
   const isResume = fromVersionId > 0;
-  await createTables(!isResume && process.argv[2] !== 'finalize' && process.argv[2] !== 'enrich');
+  const command = process.argv[2] ?? '';
+  // Only the staging tables that are about to be rewritten get dropped; a resume run
+  // (FROM_VERSION_ID) must keep the rows written by the interrupted run.
+  const dropTables: string[] = command === 'packages' ? [PACKAGES_TABLE]
+    : (command === 'versions' && !isResume) ? [VERSIONS_TABLE]
+      : (command === '' && !isResume) ? [PACKAGES_TABLE, VERSIONS_TABLE, RANGES_TABLE] : [];
+  await createTables(dropTables);
 
-  if (process.argv[2] === 'finalize') {
+  if (command === 'finalize') {
     await finalize();
     await chClient.close();
     return;
   }
-  if (process.argv[2] === 'enrich') {
+  if (command === 'enrich') {
     await enrich();
     await chClient.close();
     return;
@@ -327,18 +372,25 @@ LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower
   const platformPkgIds = new Set<number>();
   const urlFilter = PLATFORM_HOSTS.map(p => `lower(repository_url) LIKE '%${p.host}%'`).join(' OR ');
 
-  if (isResume) {
-    logger.info(`Resuming from version id ${fromVersionId}, loading platform package ids from ClickHouse...`);
+  const loadPkgIdsFromClickHouse = async () => {
     await queryStream(`SELECT package_id FROM ${PACKAGES_TABLE}`, (row: any) => platformPkgIds.add(+row[0]));
     logger.info(`[${elapsed()}] Loaded ${platformPkgIds.size} platform packages from ${PACKAGES_TABLE}.`);
-  } else {
-    logger.info('Phase A: scanning packages for platform repository URLs...');
+  };
+
+  const runPhaseA = async () => {
+    // registry id -> registry name (e.g. npmjs.org, repo1.maven.org); one ecosystem
+    // may be served by several registries, so the name is kept per package.
+    const registryNames = new Map<number, string>();
+    for (const row of (await pg.query('SELECT id, name FROM registries')).rows) {
+      registryNames.set(+row.id, row.name);
+    }
+    logger.info(`Phase A: loaded ${registryNames.size} registries, scanning packages for platform repository URLs...`);
     let pkgBuffer: any[] = [];
     let lastPkgId = 0;
     let scanned = 0;
     for (; ;) {
       const res = await pg.query(
-        `SELECT id, name, ecosystem, repository_url FROM packages
+        `SELECT id, name, ecosystem, registry_id, repository_url FROM packages
          WHERE id > $1 AND repository_url IS NOT NULL AND repository_url <> '' AND (${urlFilter})
          ORDER BY id LIMIT $2`,
         [lastPkgId, PKG_BATCH_SIZE]);
@@ -355,6 +407,7 @@ LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower
           name: row.name,
           platform: repo.platform,
           repo_name: repo.repoName,
+          registry: registryNames.get(+row.registry_id) ?? '',
         });
       }
       if (pkgBuffer.length >= FLUSH_SIZE) {
@@ -367,6 +420,68 @@ LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower
     }
     await insertRecords(pkgBuffer, PACKAGES_TABLE);
     logger.info(`[${elapsed()}] Phase A done: ${platformPkgIds.size} platform packages loaded into ${PACKAGES_TABLE}.`);
+  };
+
+  // Rebuild the version timeline table only (sequential scan over versions, the 1.8B-row
+  // dependencies table is not touched) so version numbers can be backfilled cheaply.
+  // Interrupted runs can resume from the last logged FROM_VERSION_ID: re-scanning a range
+  // may duplicate rows in the timeline, which is harmless for the finalize aggregations.
+  const runVersionsOnly = async (maxId: number) => {
+    logger.info(`Rebuilding ${VERSIONS_TABLE} from version id ${fromVersionId} up to ${maxId} (range size ${VERSION_RANGE})...`);
+    let buffer: any[] = [];
+    let total = 0;
+    let batches = 0;
+    for (let rangeStart = fromVersionId; rangeStart <= maxId; rangeStart += VERSION_RANGE) {
+      const res = await pg.query(
+        `SELECT package_id, number, extract(epoch FROM published_at)::bigint AS epoch
+         FROM versions WHERE id >= $1 AND id < $2 AND published_at IS NOT NULL`,
+        [rangeStart, rangeStart + VERSION_RANGE]);
+      for (const row of res.rows) {
+        const pkgId = +row.package_id;
+        if (!platformPkgIds.has(pkgId)) continue;
+        buffer.push({
+          package_id: pkgId,
+          published_at: formatEpoch(+row.epoch),
+          version_number: String(row.number ?? '').slice(0, MAX_VERSION_NUMBER_LEN),
+        });
+        total++;
+      }
+      if (buffer.length >= FLUSH_SIZE) {
+        await insertRecords(buffer, VERSIONS_TABLE);
+        buffer = [];
+      }
+      batches++;
+      if (batches % 20 === 0) {
+        const nextId = rangeStart + VERSION_RANGE;
+        const pct = ((nextId - fromVersionId) / (maxId - fromVersionId) * 100).toFixed(1);
+        logger.info(`[${elapsed()}] Versions: id ${nextId} (${pct}%), platform versions ${total}. Resume with FROM_VERSION_ID=${nextId}.`);
+      }
+    }
+    if (buffer.length > 0) await insertRecords(buffer, VERSIONS_TABLE);
+    logger.info(`[${elapsed()}] ${VERSIONS_TABLE} rebuilt with ${total} versions.`);
+  };
+
+  if (command === 'packages') {
+    await runPhaseA();
+    await pg.end();
+    await chClient.close();
+    return;
+  }
+
+  if (command === 'versions') {
+    await loadPkgIdsFromClickHouse();
+    const maxId = +(await pg.query('SELECT max(id) AS max_id FROM versions')).rows[0].max_id;
+    await runVersionsOnly(maxId);
+    await pg.end();
+    await chClient.close();
+    return;
+  }
+
+  if (isResume) {
+    logger.info(`Resuming from version id ${fromVersionId}, loading platform package ids from ClickHouse...`);
+    await loadPkgIdsFromClickHouse();
+  } else {
+    await runPhaseA();
   }
 
   // ---------- Phase B: sequential range scan over versions & dependencies ----------
@@ -397,7 +512,7 @@ LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower
 
     // 1. versions in range (only platform packages kept, filtered in JS via the id set)
     const verRes = await pg.query(
-      `SELECT id, package_id, extract(epoch FROM published_at)::bigint AS epoch
+      `SELECT id, package_id, number, extract(epoch FROM published_at)::bigint AS epoch
        FROM versions WHERE id >= $1 AND id < $2 AND published_at IS NOT NULL`,
       [rangeStart, rangeEnd]);
     // version id -> { pkgId, epoch }
@@ -406,7 +521,11 @@ LEFT JOIN ${NAME_MAP_TABLE} m2 ON m2.platform = d.dep_platform AND m2.name_lower
       const pkgId = +row.package_id;
       if (!platformPkgIds.has(pkgId)) continue;
       versionInfo.set(+row.id, { pkgId, epoch: +row.epoch });
-      versionBuffer.push({ package_id: pkgId, published_at: formatEpoch(+row.epoch) });
+      versionBuffer.push({
+        package_id: pkgId,
+        published_at: formatEpoch(+row.epoch),
+        version_number: String(row.number ?? '').slice(0, MAX_VERSION_NUMBER_LEN),
+      });
     }
     totalVersions += versionInfo.size;
 

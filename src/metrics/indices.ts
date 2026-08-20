@@ -123,6 +123,7 @@ FROM
 (
   SELECT
     time, id, argMax(name, time) AS name,
+    ${getTopLevelPlatform(config)},
     SUM(or) AS openrank,
     ${limit > 0
       ? `arraySlice(arraySort(x -> -x.4, groupArray(tuple(events.actor_platform, actor_id, actor_login, or))), 1, ${limit}) AS details`
@@ -142,7 +143,7 @@ FROM
     HAVING or > 0
   ) events
   ${getInnerGroupBy(config)}
-  ${getInnerOrderAndLimit(config, 'total_openrank')}
+  ${getInnerOrderAndLimit(config, 'openrank')}
 )
 GROUP BY id, platform
 ${getOutterOrderAndLimit(config, 'openrank')}
@@ -478,7 +479,7 @@ export const getUserTalent = async (config: QueryConfig): Promise<any[]> => {
     return user.years[year];
   };
 
-  const POWER_MEAN_P = 4; // Power Mean exponent: higher values emphasize top contributions more
+  const POWER_MEAN_P = 8; // Power Mean exponent: higher values emphasize top contributions more
 
   // 1. Pull quality data
   const pullSql = `

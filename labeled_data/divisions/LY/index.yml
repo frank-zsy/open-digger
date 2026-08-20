@@ -83,6 +83,9 @@ meta:
     - year: 2025
       quarter: 4
       count: 66426
+    - year: 2026
+      quarter: 1
+      count: 73665
 data:
   labels:
     - LY-BA
